@@ -22,3 +22,5 @@ wheels/
 .DS_Store
 .idea/
 .vscode/
+
+grafana_data/
