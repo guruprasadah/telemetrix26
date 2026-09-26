@@ -1,0 +1,10 @@
+apiVersion: 1
+
+datasources:
+  - name: Telemetrix
+    uid: telemetrix
+    type: simpod-json-datasource
+    access: proxy
+    url: http://host.docker.internal:7777
+    isDefault: true
+    editable: true

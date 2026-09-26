@@ -6,4 +6,8 @@ version = "0.0.1"
 members = [
     "packages/generator",
     "packages/transport",
+    "packages/dashboard",
+    "packages/dashboardv2",
+    "packages/generatorv2",
+    "packages/dashboardv3",
 ]
