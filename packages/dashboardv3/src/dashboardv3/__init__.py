@@ -201,15 +201,24 @@ class TelemetryStore:
         self.lock = threading.RLock()
 
         # series[vehicle_id][metric] = deque([(ts_ms, value), ...])
+        # INVARIANT: every deque is sorted ascending by ts_ms, even when
+        # messages arrive out of order (maintained by _append()).
         self.series: Dict[str, Dict[str, deque]] = defaultdict(lambda: defaultdict(deque))
-        # latest[vehicle_id] = last full message received
+        # latest[vehicle_id] = last IN-ORDER message received
         self.latest: Dict[str, dict] = {}
-        # previous state per vehicle (for delta detection)
+        # prev[vehicle_id] = previous IN-ORDER message (for delta detection).
+        # Duplicates and out-of-order samples NEVER become `prev`.
         self.prev: Dict[str, dict] = {}
+        # Newest vehicle timestamp (ms) stored per vehicle. Authoritative
+        # reference for out-of-order + gap checks, so a late sample can
+        # never drag the reference backwards.
+        self._last_ts: Dict[str, int] = {}
         # rolling event log
         self.events: deque = deque(maxlen=DEFAULT_MAX_EVENTS)
-        # dedup cache for message_id
-        self._seen_ids: deque = deque(maxlen=DEFAULT_DUP_CACHE_SIZE)
+        # dedup cache: FIFO deque (eviction order) + set (O(1) lookup).
+        # Deliberately NO maxlen: eviction is manual in _remember_id() so
+        # set and deque can never drift out of sync.
+        self._seen_ids: deque = deque()
         self._seen_set: set = set()
         # rolling count of messages for mps calc (keyed on wall-clock)
         self._recent_msgs: deque = deque(maxlen=600)  # (wall_ms, 1)
@@ -222,14 +231,61 @@ class TelemetryStore:
         self.start_time = time.time()
         self.total_ingested = 0
         self.total_events = 0
+        self.total_duplicates = 0
+        self.total_out_of_order = 0
 
     # ---- Public API ----------------------------------------------------
     def ingest(self, msg: dict):
         if not isinstance(msg, dict):
             return
+        vid = msg.get("vehicle_id")
+        if not vid:
+            return
+        ts_ms = self._parse_ts_ms(msg.get("vehicle_timestamp") or msg.get("timestamp"))
+        mid = msg.get("message_id")
+
         with self.lock:
-            self._store_message(msg)
-            for ev in self._detect_events(msg):
+            # -- 1) Dedupe FIRST ----------------------------------------
+            # A repeated message must not touch the series, skew the
+            # throughput counters, or re-run inference.
+            if mid:
+                if mid in self._seen_set:
+                    self.total_duplicates += 1
+                    if self._can_emit(vid, "duplicate", ts_ms):
+                        self._emit_event(self._make_event(
+                            "duplicate", vid, ts_ms,
+                            f"Duplicate message_id {mid} from {vid} (dropped)",
+                        ))
+                    return
+                self._remember_id(mid)
+
+            # -- 2) Out-of-order ----------------------------------------
+            # Compare against the NEWEST timestamp stored for this vehicle,
+            # not the previously-arrived message.
+            last_ts = self._last_ts.get(vid)
+            if last_ts is not None and ts_ms < last_ts:
+                self.total_out_of_order += 1
+                if self._can_emit(vid, "out_of_order", ts_ms):
+                    late_s = (last_ts - ts_ms) / 1000.0
+                    self._emit_event(self._make_event(
+                        "out_of_order", vid, ts_ms,
+                        f"{vid} emitted an out-of-order timestamp "
+                        f"(now={ts_ms} is {late_s:.1f}s behind last={last_ts})",
+                    ))
+                # Store the stale sample in its correct chronological slot so
+                # charts stay sorted, but do NOT advance prev/latest/last_ts
+                # with stale data and do NOT run delta-based inference on it.
+                self._store_points(msg, vid, ts_ms, out_of_order=True)
+                self._recent_msgs.append((int(time.time() * 1000), 1))
+                self.total_ingested += 1
+                self._prune_if_needed()
+                return
+
+            # -- 3) In-order message: store, then infer -----------------
+            prev = self.prev.get(vid)
+            prev_ts = last_ts  # timestamp of `prev` (last in-order message)
+            self._store_message(msg, vid, ts_ms)
+            for ev in self._detect_events(msg, vid, ts_ms, prev, prev_ts):
                 self._emit_event(ev)
             self._prune_if_needed()
 
@@ -315,63 +371,61 @@ class TelemetryStore:
         return out
 
     # ---- Internal: storage --------------------------------------------
-    def _store_message(self, msg: dict):
-        vid = msg.get("vehicle_id")
-        if not vid:
-            return
-        ts_ms = self._parse_ts_ms(msg.get("vehicle_timestamp") or msg.get("timestamp"))
+    def _remember_id(self, mid: str):
+        """Record a message_id, evicting the oldest when over budget.
+        Set and deque are always mutated together -> never desync."""
+        self._seen_set.add(mid)
+        self._seen_ids.append(mid)
+        while len(self._seen_ids) > DEFAULT_DUP_CACHE_SIZE:
+            old = self._seen_ids.popleft()
+            self._seen_set.discard(old)
+
+    def _store_message(self, msg: dict, vid: str, ts_ms: int):
+        """Store an IN-ORDER message and advance per-vehicle state."""
         self.latest[vid] = msg
+        self._last_ts[vid] = ts_ms
+        self.prev[vid] = msg
         self.vehicle_meta[vid] = {
             "vehicle_type": msg.get("vehicle_type", "?"),
             "engine_type":  msg.get("engine_type", "?"),
             "driver_id":    msg.get("driver_id", "?"),
         }
-        self._append(vid, "speed_kmh", ts_ms, msg.get("speed_kmh"))
-        self._append(vid, "odometer_km", ts_ms, msg.get("odometer_km"))
-        self._append(vid, "rpm", ts_ms, msg.get("rpm"))
-        self._append(vid, "gear", ts_ms, msg.get("gear"))
-        self._append(vid, "signal_quality", ts_ms, msg.get("signal_quality"))
-        self._append(vid, "route_progress", ts_ms, msg.get("route_progress"))
-        self._append(vid, "route_deviation_m", ts_ms, msg.get("route_deviation_m"))
-        self._append(vid, "ignition_on", ts_ms,
-                     1 if msg.get("ignition_on") else 0)
-        eng = msg.get("engine_status", "OFF")
-        self._append(vid, "engine_status_code", ts_ms,
-                     ENGINE_STATUS_CODES.get(eng, 0))
-        codes = msg.get("diagnostic_codes") or []
-        if not isinstance(codes, list):
-            codes = []
-        self._append(vid, "diagnostic_codes_count", ts_ms, len(codes))
-        loc = msg.get("location") or {}
-        if isinstance(loc, dict):
-            self._append(vid, "lat", ts_ms, loc.get("lat"))
-            self._append(vid, "lng", ts_ms, loc.get("lng"))
-            self._append(vid, "heading", ts_ms, loc.get("heading"))
-        if msg.get("fuel_level_pct") is not None:
-            self._append(vid, "fuel_level_pct", ts_ms, msg["fuel_level_pct"])
-        if msg.get("battery_level_pct") is not None:
-            self._append(vid, "battery_level_pct", ts_ms, msg["battery_level_pct"])
-
+        self._store_points(msg, vid, ts_ms)
         self._update_fleet_metrics(ts_ms)
         self._recent_msgs.append((int(time.time() * 1000), 1))
         self.total_ingested += 1
 
-        # Duplicate detection
-        mid = msg.get("message_id")
-        if mid:
-            if mid in self._seen_set:
-                self._emit_event(self._make_event(
-                    "duplicate", vid, ts_ms,
-                    f"Duplicate message_id {mid} from {vid}",
-                ))
-            else:
-                self._seen_set.add(mid)
-                self._seen_ids.append(mid)
-                if len(self._seen_ids) >= DEFAULT_DUP_CACHE_SIZE:
-                    old = self._seen_ids.popleft()
-                    self._seen_set.discard(old)
+    def _store_points(self, msg: dict, vid: str, ts_ms: int,
+                      out_of_order: bool = False):
+        """Append one message's data points to the series deques."""
+        self._append(vid, "speed_kmh", ts_ms, msg.get("speed_kmh"), out_of_order)
+        self._append(vid, "odometer_km", ts_ms, msg.get("odometer_km"), out_of_order)
+        self._append(vid, "rpm", ts_ms, msg.get("rpm"), out_of_order)
+        self._append(vid, "gear", ts_ms, msg.get("gear"), out_of_order)
+        self._append(vid, "signal_quality", ts_ms, msg.get("signal_quality"), out_of_order)
+        self._append(vid, "route_progress", ts_ms, msg.get("route_progress"), out_of_order)
+        self._append(vid, "route_deviation_m", ts_ms, msg.get("route_deviation_m"), out_of_order)
+        self._append(vid, "ignition_on", ts_ms,
+                     1 if msg.get("ignition_on") else 0, out_of_order)
+        eng = msg.get("engine_status", "OFF")
+        self._append(vid, "engine_status_code", ts_ms,
+                     ENGINE_STATUS_CODES.get(eng, 0), out_of_order)
+        codes = msg.get("diagnostic_codes") or []
+        if not isinstance(codes, list):
+            codes = []
+        self._append(vid, "diagnostic_codes_count", ts_ms, len(codes), out_of_order)
+        loc = msg.get("location") or {}
+        if isinstance(loc, dict):
+            self._append(vid, "lat", ts_ms, loc.get("lat"), out_of_order)
+            self._append(vid, "lng", ts_ms, loc.get("lng"), out_of_order)
+            self._append(vid, "heading", ts_ms, loc.get("heading"), out_of_order)
+        if msg.get("fuel_level_pct") is not None:
+            self._append(vid, "fuel_level_pct", ts_ms, msg["fuel_level_pct"], out_of_order)
+        if msg.get("battery_level_pct") is not None:
+            self._append(vid, "battery_level_pct", ts_ms, msg["battery_level_pct"], out_of_order)
 
-    def _append(self, vid: str, metric: str, ts_ms: int, value: Any):
+    def _append(self, vid: str, metric: str, ts_ms: int, value: Any,
+                out_of_order: bool = False):
         if value is None:
             return
         if isinstance(value, bool):
@@ -380,7 +434,18 @@ class TelemetryStore:
             return
         if isinstance(value, float) and value != value:  # NaN check
             return
-        self.series[vid][metric].append((ts_ms, value))
+        dq = self.series[vid][metric]
+        point = (ts_ms, value)
+        if out_of_order and dq and ts_ms < dq[-1][0]:
+            # Rare path: insert the late sample at its chronological
+            # position so the deque stays time-sorted. This keeps the
+            # sustained-window checks and Grafana queries correct.
+            i = len(dq) - 1
+            while i > 0 and dq[i - 1][0] > ts_ms:
+                i -= 1
+            dq.insert(i, point)
+        else:
+            dq.append(point)
 
     def _update_fleet_metrics(self, ts_ms: int):
         cutoff = ts_ms - 30_000
@@ -388,17 +453,18 @@ class TelemetryStore:
         speeds: List[float] = []
         fuels: List[float] = []
         for vid, m in self.latest.items():
-            m_ts = self._parse_ts_ms(m.get("vehicle_timestamp") or m.get("timestamp"))
-            if m_ts and m_ts >= cutoff:
-                online += 1
-                spd = m.get("speed_kmh")
-                if isinstance(spd, (int, float)):
-                    speeds.append(spd)
-                f = m.get("fuel_level_pct")
-                if f is None:
-                    f = m.get("battery_level_pct")
-                if isinstance(f, (int, float)):
-                    fuels.append(f)
+            m_ts = self._last_ts.get(vid, 0)
+            if m_ts < cutoff:
+                continue
+            online += 1
+            spd = m.get("speed_kmh")
+            if isinstance(spd, (int, float)):
+                speeds.append(spd)
+            f = m.get("fuel_level_pct")
+            if f is None:
+                f = m.get("battery_level_pct")
+            if isinstance(f, (int, float)):
+                fuels.append(f)
         self._append("*", "fleet.vehicles_online", ts_ms, online)
         self._append("*", "fleet.messages_per_sec", ts_ms, self._compute_mps())
         self._append("*", "fleet.alerts_active", ts_ms,
@@ -416,55 +482,49 @@ class TelemetryStore:
         return round(len(self._recent_msgs) / 5.0, 2)
 
     # ---- Internal: inference ------------------------------------------
-    def _detect_events(self, msg: dict) -> List[dict]:
+    def _detect_events(self, msg: dict, vid: str, ts_ms: int,
+                       prev: Optional[dict], prev_ts: Optional[int]) -> List[dict]:
+        """
+        Run inference on an IN-ORDER message only.
+
+        `prev`/`prev_ts` describe the previous in-order message for this
+        vehicle. Duplicates and out-of-order samples never reach this
+        method, so delta-based checks always compare two chronologically
+        adjacent, fresh samples.
+        """
         events: List[dict] = []
-        vid = msg.get("vehicle_id")
-        if not vid:
-            return events
-        ts_ms = self._parse_ts_ms(msg.get("vehicle_timestamp") or msg.get("timestamp"))
-        prev = self.prev.get(vid, {})
-        self.prev[vid] = msg
+        prev = prev or {}
 
         # 1) Invalid / anomalous values (catches the 'invalid' fault)
         ev = self._check_invalid(msg, vid, ts_ms)
         if ev:
             events.append(ev)
 
-        # 2) Missing gap detection
-        if prev:
-            prev_ts = self._parse_ts_ms(prev.get("vehicle_timestamp") or prev.get("timestamp"))
-            if prev_ts and ts_ms > prev_ts:
-                gap_s = (ts_ms - prev_ts) / 1000.0
-                rate_hz = prev.get("telemetry_rate_hz") or msg.get("telemetry_rate_hz") or 1.0
-                try:
-                    expected = 1.0 / float(rate_hz) if float(rate_hz) > 0 else 1.0
-                except (TypeError, ValueError):
-                    expected = 1.0
-                if gap_s > expected * GAP_MISSING_FACTOR:
-                    if self._can_emit(vid, "missing", ts_ms):
-                        events.append(self._make_event(
-                            "missing", vid, ts_ms,
-                            f"Gap of {gap_s:.1f}s in {vid} telemetry "
-                            f"(expected ~{expected:.1f}s)",
-                        ))
-
-        # 3) Out-of-order timestamp
-        if prev:
-            prev_ts = self._parse_ts_ms(prev.get("vehicle_timestamp") or prev.get("timestamp"))
-            if prev_ts and ts_ms < prev_ts:
-                if self._can_emit(vid, "out_of_order", ts_ms):
+        # 2) Missing gap detection (in-order only, so ts_ms >= prev_ts)
+        if prev_ts:
+            gap_s = (ts_ms - prev_ts) / 1000.0
+            rate_hz = prev.get("telemetry_rate_hz") or msg.get("telemetry_rate_hz") or 1.0
+            try:
+                expected = 1.0 / float(rate_hz) if float(rate_hz) > 0 else 1.0
+            except (TypeError, ValueError):
+                expected = 1.0
+            if gap_s > expected * GAP_MISSING_FACTOR:
+                if self._can_emit(vid, "missing", ts_ms):
                     events.append(self._make_event(
-                        "out_of_order", vid, ts_ms,
-                        f"{vid} emitted an out-of-order timestamp "
-                        f"(prev={prev_ts}, now={ts_ms})",
+                        "missing", vid, ts_ms,
+                        f"Gap of {gap_s:.1f}s in {vid} telemetry "
+                        f"(expected ~{expected:.1f}s)",
                     ))
+
+        # NOTE: out-of-order detection lives in ingest(), BEFORE prev is
+        # advanced, so a stale sample can never become the reference point
+        # and cause false missing/harsh/fuel-theft events downstream.
 
         eng = msg.get("engine_status")
         codes = msg.get("diagnostic_codes") or []
         crash_codes = {"B1100", "B1234", "C0300", "C1201"}
 
-        # 4) Crash: FAULT + stationary + crash DTC.
-        # A random unrelated DTC is not itself a crash.
+        # 3) Crash: FAULT + stationary + crash DTC.
         crash_match = bool(set(codes) & crash_codes)
         if eng == "FAULT" and isinstance(speed := msg.get("speed_kmh"), (int, float)) and speed < 5 and crash_match:
             if self._can_emit(vid, "crash", ts_ms):
@@ -477,11 +537,12 @@ class TelemetryStore:
         speed = msg.get("speed_kmh")
         prev_speed = prev.get("speed_kmh")
 
-        # 5) Harsh braking / acceleration (rate-of-change of speed)
-        if (isinstance(speed, (int, float)) and
-                isinstance(prev_speed, (int, float))):
-            prev_ts = self._parse_ts_ms(prev.get("vehicle_timestamp") or prev.get("timestamp"))
-            dt_s = max(0.1, (ts_ms - prev_ts) / 1000.0) if prev_ts else 1.0
+        # 4) Harsh braking / acceleration. Requires strictly increasing
+        #    timestamps: zero elapsed time yields no meaningful rate.
+        if (prev_ts and ts_ms > prev_ts
+                and isinstance(speed, (int, float))
+                and isinstance(prev_speed, (int, float))):
+            dt_s = max(0.1, (ts_ms - prev_ts) / 1000.0)
             delta = speed - prev_speed
             rate = delta / dt_s
             if rate <= -HARSH_BRAKING_KMH_PER_S and prev_speed > 20:
@@ -500,6 +561,8 @@ class TelemetryStore:
                     ))
 
         def sustained_speed(predicate, sustain_s: float) -> bool:
+            # deques are time-sorted (see _append), so window[0] really is
+            # the oldest point in the window.
             hist = list(self.series[vid].get("speed_kmh", []))
             if not hist:
                 return False
@@ -509,7 +572,7 @@ class TelemetryStore:
                 return False
             return all(predicate(v) for _, v in window)
 
-        # 6) Overspeed: >100 km/h continuously for 5 seconds.
+        # 5) Overspeed: >100 km/h continuously for 5 seconds.
         if isinstance(speed, (int, float)) and speed > OVERSPEED_KMH:
             if sustained_speed(lambda v: v > OVERSPEED_KMH, OVERSPEED_SUSTAIN_S):
                 if self._can_emit(vid, "overspeed", ts_ms):
@@ -518,7 +581,7 @@ class TelemetryStore:
                         f"{vid} sustained speed > {OVERSPEED_KMH} km/h for {OVERSPEED_SUSTAIN_S}s",
                     ))
 
-        # 7) Prolonged idle: <1 km/h continuously for 30 seconds.
+        # 6) Prolonged idle: <1 km/h continuously for 30 seconds.
         if eng in ("IDLE", "ON") and isinstance(speed, (int, float)) and speed < IDLE_SPEED_KMH:
             if sustained_speed(lambda v: v < IDLE_SPEED_KMH, IDLE_SUSTAIN_S):
                 if self._can_emit(vid, "idle", ts_ms):
@@ -527,7 +590,7 @@ class TelemetryStore:
                         f"{vid} has been idling for > {IDLE_SUSTAIN_S}s",
                     ))
 
-        # 8) Unauthorized use: 75-85 km/h continuously for 30 seconds.
+        # 7) Unauthorized use: 75-85 km/h continuously for 30 seconds.
         if (isinstance(speed, (int, float))
                 and UNAUTHORIZED_SPEED_BAND[0] <= speed <= UNAUTHORIZED_SPEED_BAND[1]):
             if sustained_speed(
@@ -541,7 +604,7 @@ class TelemetryStore:
                         f"km/h for {UNAUTHORIZED_SUSTAIN_S}s",
                     ))
 
-        # 9) Route deviation: >300m from planned route for 5 seconds.
+        # 8) Route deviation: >300m from planned route for 5 seconds.
         route_dev = msg.get("route_deviation_m", 0.0)
         if isinstance(route_dev, (int, float)) and route_dev > ROUTE_DEV_DISTANCE_M:
             hist = [
@@ -555,7 +618,7 @@ class TelemetryStore:
                         f"{vid} remained > {ROUTE_DEV_DISTANCE_M:.0f}m off route for {ROUTE_DEV_SUSTAIN_S}s",
                     ))
 
-        # 10) Fuel / battery theft (sudden drop while stationary)
+        # 9) Fuel / battery theft (sudden drop while stationary)
         fuel_now = msg.get("fuel_level_pct")
         if fuel_now is None:
             fuel_now = msg.get("battery_level_pct")
@@ -573,7 +636,7 @@ class TelemetryStore:
                         f"{vid} lost {drop:.1f}% fuel/battery while stationary",
                     ))
 
-        # 11) Low fuel / battery warnings
+        # 10) Low fuel / battery warnings
         if isinstance(fuel_now, (int, float)):
             if "fuel_level_pct" in msg and fuel_now < LOW_FUEL_PCT:
                 if self._can_emit(vid, "low_fuel", ts_ms):
@@ -589,7 +652,6 @@ class TelemetryStore:
                     ))
 
         return events
-
     def _check_invalid(self, msg: dict, vid: str, ts_ms: int) -> Optional[dict]:
         """Detect anomalous/invalid values (the 'invalid' fault)."""
         if not self._can_emit(vid, "invalid_data", ts_ms):
