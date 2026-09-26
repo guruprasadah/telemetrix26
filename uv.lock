@@ -1,0 +1,19 @@
+version = 1
+revision = 3
+requires-python = ">=3.14"
+
+[manifest]
+members = [
+    "generator",
+    "telemetrix",
+]
+
+[[package]]
+name = "generator"
+version = "0.1.0"
+source = { editable = "packages/generator" }
+
+[[package]]
+name = "telemetrix"
+version = "0.0.1"
+source = { virtual = "." }
