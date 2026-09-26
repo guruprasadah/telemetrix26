@@ -1,0 +1,24 @@
+# --- Python build and cache artifacts ---
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+wheels/
+*.egg-info/
+
+# --- uv / Virtual Environments ---
+# uv automatically places an internal .gitignore inside .venv, 
+# but it is good practice to explicitly ignore it here too.
+.venv/
+
+# --- Environment variables and secrets ---
+# Always ignore local environment files to prevent secret leaks
+.env
+.env.local
+.env.*.local
+
+# --- IDEs and OS metadata ---
+.DS_Store
+.idea/
+.vscode/

@@ -5,4 +5,5 @@ version = "0.0.1"
 [tool.uv.workspace]
 members = [
     "packages/generator",
+    "packages/transport",
 ]
